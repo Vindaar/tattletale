@@ -8,6 +8,7 @@
 
 import workspace/crucible/src/abis/c_abi
 import workspace/crucible/src/abis/nvidia_abi
+import workspace/crucible/src/abis/nvidia_paths
 
 import workspace/crucible/src/crucible_codegen
 import workspace/crucible/src/runtime/backends/cuda_runtime
@@ -50,9 +51,10 @@ proc newCudaEngine*(): CudaEngine =
 # ▸ PUBLIC API
 # ═══════════════════════════════════════════════════════════════════════
 
-proc ingest*(engine: CudaEngine, source: string) =
+proc ingest*(engine: CudaEngine, source: string, options: openArray[string] = []) =
+  ## Compiles `source`; `options` are passed on to NVRTC (e.g. `--fmad=false`).
   engine.nvrtc.createProgram(source)
-  engine.nvrtc.compile()
+  engine.nvrtc.compile(options)
   engine.nvrtc.extractPtx()
   engine.source = source
 
@@ -168,12 +170,19 @@ proc readLog(nvrtc: var NVRTC) =
   check nvrtcGetProgramLog(nvrtc.prog, log)
   nvrtc.log = $log # usually empty if no issues found by the compiler
 
-proc compile(nvrtc: var NVRTC, compute_capability = cudaGetComputeCapability()) =
+proc compile(nvrtc: var NVRTC, extra: openArray[string] = [],
+             compute_capability = cudaGetComputeCapability()) =
   let arch = "--gpu-architecture=compute_" & $compute_capability
   var options = @[
     cstring arch,
     cstring "-default-device",           # namespace-scope vars default to __device__
+    cstring "--std=c++17",               # the default of NVRTC 12, not of NVRTC 11
   ]
+  for o in extra:
+    options.add cstring(o)
+  const includePath = "--include-path=" & CudaIncludeDir
+  when CudaIncludeDir.len > 0:
+    options.add cstring includePath
   let numberOfOptions = cint options.len
   let compileResult =  nvrtcCompileProgram(nvrtc.prog, numberOfOptions,
                                            cast[cstringArray](addr options[0]))

@@ -34,6 +34,15 @@ const CudaHome* = block:
     elif dirExists("/opt/cuda"): "/opt/cuda"
     else: ""
 
+## The directory holding the CUDA headers NVRTC needs (``cuda_fp16.h``, ...),
+## ``""`` if not found. NVRTC before CUDA 12 has no built-in copies of them.
+## Distribution packages install them to ``/usr/include``.
+const CudaIncludeDir* = block:
+  if CudaHome.len > 0 and fileExists(CudaHome / "include" / "cuda_fp16.h"):
+    CudaHome / "include"
+  elif fileExists("/usr/include/cuda_fp16.h"): "/usr/include"
+  else: ""
+
 ## Returns ``lib64`` or ``lib`` whichever exists under ``CudaHome``.
 const CudaLibDir* = block:
   if CudaHome.len > 0:

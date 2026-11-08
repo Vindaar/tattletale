@@ -242,6 +242,52 @@ func lowerCallArgs(ctx: var CirFrontend, callee: NimNode, call: NimNode): seq[Ci
     let arg = ctx.lowerExpr(call[argIdx])
     result.add(arg)
 
+func cMathName(n: NimNode): string =
+  ## The C name of a function imported from `<math.h>` over floats, "" otherwise.
+  if n.kind != nnkSym:
+    return ""
+  let impl = n.getImpl()
+  if impl.kind notin {nnkProcDef, nnkFuncDef}:
+    return ""
+  var name, header = ""
+  for p in impl.pragma:
+    if p.kind == nnkExprColonExpr and p[0].kind in {nnkIdent, nnkSym} and
+        p[1].kind in {nnkStrLit, nnkRStrLit}:
+      case p[0].strVal
+      of "importc": name = p[1].strVal
+      of "header": header = p[1].strVal
+      else: discard
+  if header != "<math.h>" or name.len == 0:
+    return ""
+  let formals = impl.params
+  for i in 0 ..< formals.len:
+    let t = if i == 0: formals[0] else: formals[i][^2]
+    if t.kind == nnkEmpty or t.repr notin ["float32", "float64", "float", "cfloat", "cdouble"]:
+      return ""
+  return name
+
+func arrayLowBound(ctx: var CirFrontend, n: NimNode): int64 =
+  ## The first index of the Nim array `n` (1 for `array[1..N, T]`), 0 if `n`
+  ## is not an array.
+  var t = n.getTypeImpl()
+  while t.kind in {nnkVarTy, nnkPtrTy, nnkRefTy} and t.len > 0:
+    t = t[0].getTypeImpl()
+  if t.kind != nnkBracketExpr or t.len != 3 or t[0].kind notin {nnkSym, nnkIdent} or
+      t[0].strVal != "array":
+    return 0
+  var r = t[1]
+  if r.kind == nnkSym:
+    r = r.getTypeImpl()
+  if r.kind == nnkInfix and r.len == 3 and r[0].strVal == "..":
+    return ctx.resolver.evalConstInt(r[1])
+  if r.kind == nnkBracketExpr and r.len == 2 and r[0].kind in {nnkSym, nnkIdent} and
+      r[0].strVal == "range":
+    return arrayLowBound(ctx, r)
+  if r.kind == nnkBracketExpr and r.len == 3 and r[0].kind in {nnkSym, nnkIdent} and
+      r[0].strVal == "range":
+    return ctx.resolver.evalConstInt(r[1])
+  return 0
+
 func getNimMagicName(n: NimNode): string =
   ## Value of the definition's `magic: "..."` pragma, "" when absent.
   ## System integer and float operators are magics:
@@ -276,7 +322,11 @@ func harvestedCallee(ctx: var CirFrontend, calleeSym: NimNode): CirExpr =
     # body has no runtime content, a bodiless magic's documentation stub
     # renders exactly this way, so refuse and state the construct
     let body = getProcBody(calleeSym.getImpl())
-    if body.isNil or isTriviaBody(body):
+    # an empty body is fine for an ordinary proc (e.g. a `when` that leaves
+    # nothing for this instantiation), not for a magic or an import
+    let opaque = getNimMagicName(calleeSym).len > 0 or
+                 getPragmaItem(calleeSym, "importc") != nil
+    if opaque and (body.isNil or isTriviaBody(body)):
       raiseAssert("call to " & calleeSym.repr & " has no body to lower")
     ctx.harvestProc(calleeSym, entry.name)
   let calleeName = if calleeBuiltin: calleeSym.strVal
@@ -328,6 +378,14 @@ func lowerCallValue(ctx: var CirFrontend, callee: NimNode, call: NimNode): CirEx
     let spanTyp = tSpan(baseTyp.addressSpace, baseTyp.pElem)
     let callTyp = tProcT(baseTyp, firstTyp, lastTyp, spanTyp)
     return callE(sym("toOpenArray", callTyp), base, first, last)
+  if magic == "LengthArray":
+    # the length of a fixed-size array is a constant of its type
+    let at = ctx.resolver.resolveCirType(call[1].getTypeInst())
+    let lt = ctx.resolver.resolveCirType(call.getTypeInst())
+    if at.kind == ctArray:
+      return intLit(at.aN, lt)
+    if at.kind == ctPtr and at.pElem.kind == ctArray:
+      return intLit(at.pElem.aN, lt)
   if magic == "LengthOpenArray":
     # a `len(s)` read over an openArray lowers to the `len` call
     # that the span split pass folds to the span's split length binding
@@ -362,6 +420,14 @@ func lowerCallValue(ctx: var CirFrontend, callee: NimNode, call: NimNode): CirEx
     if scalar:
       let args = ctx.lowerCallArgs(calleeSym, call)
       return callE(sym(calleeSym.strVal, fnType, true), args)
+  # A scalar C math function Nim imports from `<math.h>` (std/math `sqrt`,
+  # `ln`, `cos`, `trunc`, ...) lowers as a builtin call under its C name
+  # (`sqrt`, `log`, `cosf`, ...): CUDA has device functions of the same names.
+  let mathName = cMathName(calleeSym)
+  if mathName.len > 0:
+    let fnType = ctx.resolver.resolveCirType(calleeSym.getTypeInst())
+    let args = ctx.lowerCallArgs(calleeSym, call)
+    return callE(sym(mathName, fnType, true), args)
   let calleeExpr = ctx.harvestedCallee(calleeSym)
   let args = ctx.lowerCallArgs(calleeSym, call)
   return callE(calleeExpr, args)
@@ -639,8 +705,14 @@ func lowerExpr(ctx: var CirFrontend, n: NimNode): CirExpr =
       loweredBase = ctx.lowerExpr(baseNode[0])
     else:
       loweredBase = ctx.lowerExpr(baseNode)
-    let idx = ctx.lowerExpr(unwrapConv(n[1]))
+    var idx = ctx.lowerExpr(unwrapConv(n[1]))
     let bt = getExprType(loweredBase)
+    if bt.kind in {ctArray, ctPtr}:
+      # a Nim array indexed from `lo` (`array[1..N, T]`) is a C array from 0
+      let lo = ctx.arrayLowBound(baseNode)
+      if lo != 0:
+        let it = getExprType(idx)
+        idx = arithExpr("-", it, idx, intLit(lo, it))
     case bt.kind
     of ctAptr:
       return patE(loweredBase, idx)
@@ -662,7 +734,8 @@ func lowerExpr(ctx: var CirFrontend, n: NimNode): CirExpr =
     return dotE(base, sanitizeIdent(n[1].strVal))
   of nnkInfix, nnkPrefix:
     return ctx.lowerOperatorExpr(n)
-  of nnkCall, nnkCommand:
+  of nnkCall, nnkCommand, nnkHiddenCallConv:
+    # nnkHiddenCallConv: an implicit `converter` call, `conv(x)`
     let callee = n[0]
     if callee.kind notin {nnkSym, nnkOpenSymChoice, nnkClosedSymChoice}:
       raiseAssert("value call callee " & callee.repr & " is not a proc symbol")
@@ -700,7 +773,11 @@ func lowerExpr(ctx: var CirFrontend, n: NimNode): CirExpr =
     var fields: seq[CirKv] = @[]
     for i in 0 ..< n.len:
       let v = ctx.lowerExpr(n[i])
-      fields.add(kv("F" & $i, v))
+      # tuples are structural: `(a, b)` may resolve to a named tuple's struct,
+      # whose field names are those of the type, in the same order
+      let name = if typ.kind == ctStruct and i < typ.fields.len: typ.fields[i].name
+                 else: "F" & $i
+      fields.add(kv(name, v))
     return oconstrE(typ, fields)
   of nnkBracket:
     let typ = ctx.resolver.resolveCirType(n.getTypeInst())
@@ -786,6 +863,20 @@ func lowerVoidCall(ctx: var CirFrontend, n: NimNode): seq[CirStmt] =
   if callee.kind notin {nnkSym, nnkOpenSymChoice, nnkClosedSymChoice}:
     raiseAssert("call callee " & callee.repr & " is not a proc symbol")
   let calleeSym = resolveCallCallee(callee)
+  let magic = getNimMagicName(calleeSym)
+  if magic in ["Inc", "Dec"] and n.len in 2 .. 3:
+    # `inc(x, step)` / `dec(x, step)` lowers as `x = x ± step`, step 1 by default
+    var lhs = ctx.lowerExpr(n[1])
+    if lhs.kind == eAddr:
+      lhs = lhs.addrOperand
+    elif lhs.kind == eSym and getExprType(lhs) != nil and
+        getExprType(lhs).kind == ctPtr:
+      # a var parameter is a pointer to its location
+      lhs = derefE(lhs)
+    let opType = getExprType(lhs)
+    let step = if n.len == 3: ctx.lowerExpr(unwrapConv(n[2])) else: intLit(1, opType)
+    let op = if magic == "Inc": "+" else: "-"
+    return @[asgnS(lhs, arithExpr(op, opType, lhs, step))]
   let calleeExpr = ctx.harvestedCallee(calleeSym)
   let args = ctx.lowerCallArgs(calleeSym, n)
   return @[callS(calleeExpr, args)]
@@ -1245,7 +1336,11 @@ func harvestProc(ctx: var CirFrontend, callee: NimNode, cirName: string) =
   let save = ctx.enterProcBody(cirName, formals)
   var params: seq[CirParam] = @[]
   let fnRet = ctx.locals.retType
-  let body = ctx.lowerProcBody(params, formals, getProcBody(impl))
+  var procBody = getProcBody(impl)
+  if procBody.isNil:
+    # an instantiation whose body is empty (a `when` without a branch for it)
+    procBody = newStmtList()
+  let body = ctx.lowerProcBody(params, formals, procBody)
   ctx.exitProcBody(save)
   let harvested = procD(cirName, params, fnRet, body)
   let wgErr = impl.applyProcPragmas(harvested)
