@@ -8,6 +8,7 @@
 import ../ir/cirv2_lang
 import ../frontend/nim_to_crucible
 import ../passes/pass_helpers
+import ../passes/passes_lowering_wgsl
 import std/[macros, math, sets, strutils, tables]
 import ./print_common
 import ./targets_registry
@@ -29,6 +30,9 @@ type PrintCtx = object of WalkCtx
   ## the derived type and the overlay procs below resolve per target.
   m: CirModule
   ## Module in flight.
+  atomics: HashSet[string]
+  ## `proc\x1fsymbol` of the buffers and pointer parameters an atomic
+  ## builtin reaches: their elements print as `atomic<T>`.
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Target tables
@@ -101,6 +105,8 @@ proc emitBinding(ctx: var PrintCtx, p: CirParam, i: int): string
 proc emitStructField(ctx: var PrintCtx, t: CirType, f: CirField): string
 proc printParamBindings(ctx: var PrintCtx, globalFns: seq[CirProc]): string
 proc printPrelude(ctx: var PrintCtx, m: CirModule): string
+proc getAtomicCallText(ctx: var PrintCtx, callee: CirExpr, argExprs: seq[CirExpr], args: seq[string]): string
+proc printCallArgTexts(ctx: var PrintCtx, callee: CirExpr, args: seq[CirExpr]): seq[string]
 
 proc emitWgslScalar(ctx: var PrintCtx, t: CirType): string =
   ## Returns the WGSL name of a non-array type, "" when the caller
@@ -372,9 +378,21 @@ proc printProcHead(ctx: var PrintCtx, fn: CirProc): string =
   var params: seq[string]
   for p in fn.params:
     case p.typ.kind
-    of ctPtr:
-      # WGSL signatures take only this pointer form, the call inlining removes the rest
-      params.add p.name & ": ptr<function, " & ctx.emitTypeName(p.typ.pElem) & ">"
+    of ctPtr, ctAptr:
+      # without `wgslPointerParams` only the ptr<function> form, the call inlining removes the rest
+      var elem = ctx.emitTypeName(p.typ.pElem)
+      if (fn.name & "\x1f" & p.name) in ctx.atomics:
+        elem = "atomic<" & elem & ">"
+      if p.typ.kind == ctAptr:
+        elem = "array<" & elem & ">"
+      let space = case p.typ.addressSpace
+        of caDevice: "storage"
+        of caThreadgroup: "workgroup"
+        else: "function"
+      if space != "function" and not wgslPointerParams:
+        raiseAssert("parameter " & p.name & " of " & fn.name & " points into " & space & ", WGSL needs -d:wgslPointerParams for it")
+      params.add p.name & ": ptr<" & space & ", " & elem &
+        (if space == "storage": ", read_write>" else: ">")
     else:
       params.add p.name & ": " & ctx.emitTypeName(p.typ)
   result = "fn " & fn.name & "(" & params.join(", ") & ")"
@@ -402,8 +420,10 @@ proc emitBinding(ctx: var PrintCtx, p: CirParam, i: int): string =
   let attr = "@group(0) @binding(" & $i & ") "
   case p.typ.kind
   of ctAptr:
-    result = attr & "var<storage, read_write> " & p.name & ": array<" &
-      ctx.emitTypeName(p.typ.pElem) & ">;"
+    var elem = ctx.emitTypeName(p.typ.pElem)
+    if (getEntryGlobalFn(ctx, ctx.m).name & "\x1f" & p.name) in ctx.atomics:
+      elem = "atomic<" & elem & ">"
+    result = attr & "var<storage, read_write> " & p.name & ": array<" & elem & ">;"
   of ctPtr:
     raiseAssert("globalFn parameter " & p.name & " of pointer type has no WGSL binding")
   of ctArray:
@@ -460,14 +480,157 @@ proc printPrelude(ctx: var PrintCtx, m: CirModule): string =
             break scan
   if m.features.fp16:
     result = declareExtensions(m.features, [(true, "enable f16;\n")])
+  when wgslPointerParams:
+    block pointers:
+      for fn in m.procs:
+        if not fn.isGlobalFn:
+          for p in fn.params:
+            if p.typ.kind in {ctPtr, ctAptr} and p.typ.addressSpace != caThread:
+              result &= "requires unrestricted_pointer_parameters, pointer_composite_access;\n\n"
+              break pointers
   if usesNimBool:
     result &= "alias NIM_BOOL = u32;\n\n"
+  when wgslPreciseMath:
+    result &= wgslPreciseMathSource & "\n"
+
+proc rootSymbol(e: CirExpr): string =
+  ## The variable an access chain starts from, "" for none.
+  var x = e
+  while x != nil:
+    case x.kind
+    of eAddr: x = x.addrOperand
+    of eAt: x = x.atBase
+    of ePat: x = x.patBase
+    of eDeref: x = x.derefOperand
+    of eCast, eConv: x = x.castOperand
+    of eSym: return x.name
+    else: return ""
+  ""
+
+proc scanAtomics(m: CirModule): HashSet[string] =
+  ## `proc\x1fsymbol` of every buffer an atomic builtin reaches, through the
+  ## pointer parameters that pass it on: WGSL types them `atomic<T>`.
+  var procs: Table[string, CirProc]
+  for fn in m.procs:
+    procs[fn.name] = fn
+  proc calls(fn: CirProc, visit: proc(callee: CirExpr, args: seq[CirExpr])) =
+    fn.body.walkStmts(proc(s: CirStmt) =
+      if s.kind == sCall: visit(s.callCallee, s.callArgs),
+    proc(e: CirExpr) =
+      if e.kind == eCall: visit(e.callee, e.args))
+  var direct: seq[string]
+  for fn in m.procs:
+    let name = fn.name
+    fn.calls(proc(callee: CirExpr, args: seq[CirExpr]) =
+      if callee.kind == eSym and callee.atomicsBuiltin != cbkNone and args.len > 0:
+        let r = rootSymbol(args[0])
+        if r.len > 0: direct.add(name & "\x1f" & r))
+  for d in direct:
+    result.incl d
+  var changed = true
+  while changed:
+    changed = false
+    for fn in m.procs:
+      let name = fn.name
+      var found: seq[string]
+      let marked = result
+      fn.calls(proc(callee: CirExpr, args: seq[CirExpr]) =
+        if callee.kind != eSym: return
+        let g = procs.getOrDefault(callee.name)
+        if g == nil: return
+        for j, p in g.params:
+          if j < args.len and (g.name & "\x1f" & p.name) in marked:
+            let r = rootSymbol(args[j])
+            if r.len > 0 and (name & "\x1f" & r) notin marked:
+              found.add(name & "\x1f" & r))
+      for f in found:
+        result.incl f
+        changed = true
+
+proc getAtomicCallText(ctx: var PrintCtx, callee: CirExpr, argExprs: seq[CirExpr], args: seq[string]): string =
+  ## `atomicAdd` over an `atomic<T>` element, the buffer's type from `scanAtomics`.
+  "atomicAdd(" & args[0] & ", " & args[1] & ")"
+
+proc printCallArgTexts(ctx: var PrintCtx, callee: CirExpr, args: seq[CirExpr]): seq[string] =
+  ## A device-buffer binding passes on as the address of its array.
+  let entry = getEntryGlobalFn(ctx, ctx.m)
+  for a in args:
+    var txt = ctx.printExpr(a)
+    if wgslPointerParams and ctx.inGlobalFn and a.kind == eSym and a.typ != nil and a.typ.kind == ctAptr and
+        a.typ.addressSpace == caDevice:
+      for p in entry.params:
+        if p.name == a.name:
+          txt = "(&" & txt & ")"
+    result.add txt
+
+const wgslPreciseMath* {.booldefine.} = false
+  ## acos, asin, sin, cos and log as accurate f32 functions (to 4e-7) in
+  ## place of WGSL's builtins: acos and asin inherit atan2's 4096 ULP, sin
+  ## and cos are good to 2^-11 absolute (and measured 2e-4 on SwiftShader)
+
+const wgslPreciseMathSource = """
+// accurate f32 math for WGSL (whose acos/asin inherit atan2's 4096 ULP,
+// sin/cos 2^-11 absolute): Abramowitz-Stegun 4.4.46, Cephes sinf/cosf/logf
+fn precise_acos(x: f32) -> f32 {
+  let a = min(abs(x), 1.0);
+  var p = -0.0012624911;
+  p = p * a + 0.0066700901; p = p * a - 0.0170881256; p = p * a + 0.0308918810;
+  p = p * a - 0.0501743046; p = p * a + 0.0889789874; p = p * a - 0.2145988016;
+  p = p * a + 1.5707963050;
+  let r = sqrt(1.0 - a) * p;
+  return select(r, 3.14159265358979 - r, x < 0.0);
+}
+fn precise_asin(x: f32) -> f32 { return 1.57079632679490 - precise_acos(x); }
+fn precise_sincos_poly(y: f32, q: i32) -> vec2<f32> {
+  let z = y * y;
+  let s = y + y * z * ((-1.9515295891e-4 * z + 8.3321608736e-3) * z - 1.6666654611e-1);
+  let c = 1.0 - 0.5 * z + z * z * ((2.443315711809948e-5 * z - 1.388731625493765e-3) * z + 4.166664568298827e-2);
+  // (sin, cos) of y + q pi/2
+  switch (q & 3) {
+    case 0: { return vec2<f32>(s, c); }
+    case 1: { return vec2<f32>(c, -s); }
+    case 2: { return vec2<f32>(-s, -c); }
+    default: { return vec2<f32>(-c, s); }
+  }
+}
+fn precise_reduce(x: f32) -> vec2<f32> {
+  let j = round(x * 0.636619772367581);
+  let y = ((x - j * 1.5703125) - j * 4.8375129699707031e-4) - j * 7.5497899548918821e-8;
+  return vec2<f32>(y, j);
+}
+fn precise_sin(x: f32) -> f32 { let r = precise_reduce(x); return precise_sincos_poly(r.x, i32(r.y)).x; }
+fn precise_cos(x: f32) -> f32 { let r = precise_reduce(x); return precise_sincos_poly(r.x, i32(r.y)).y; }
+fn precise_log(x0: f32) -> f32 {
+  let fr = frexp(x0);
+  var x = fr.fract;
+  var e = f32(fr.exp);
+  if (x < 0.707106781186547) { e = e - 1.0; x = x + x - 1.0; } else { x = x - 1.0; }
+  let z = x * x;
+  var y = 7.0376836292e-2;
+  y = y * x - 1.1514610310e-1; y = y * x + 1.1676998740e-1; y = y * x - 1.2420140846e-1;
+  y = y * x + 1.4249322787e-1; y = y * x - 1.6668057665e-1; y = y * x + 2.0000714765e-1;
+  y = y * x - 2.4999993993e-1; y = y * x + 3.3333331174e-1;
+  y = y * x * z;
+  y = y - 2.12194440e-4 * e;
+  y = y - 0.5 * z;
+  return x + y + 0.693359375 * e;
+}
+"""
+
+const wgslPreciseNames = [("acos", "precise_acos"), ("acosf", "precise_acos"),
+  ("asin", "precise_asin"), ("asinf", "precise_asin"), ("sin", "precise_sin"),
+  ("sinf", "precise_sin"), ("cos", "precise_cos"), ("cosf", "precise_cos"),
+  ("log", "precise_log"), ("logf", "precise_log"), ("ln", "precise_log")]
 
 proc printWgslModule*(m: CirModule): string =
   var ctx = initPrintCtx(wgslWalkPolicy, wgslVectorRule, wgslEmit, cgWebGPU)
   ctx.mathNames = wgslMathBuiltinNames
+  when wgslPreciseMath:
+    for (c, precise) in wgslPreciseNames:
+      ctx.mathNames[(c, 32)] = precise
   let globalFn = getEntryGlobalFn(ctx, m)
   ctx.m = m
+  ctx.atomics = scanAtomics(m)
   printModule(ctx, m, @[globalFn], wgslModuleShape)
 
 proc codegen*(m: CirModule): string =

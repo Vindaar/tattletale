@@ -91,7 +91,7 @@ const WgslReserved* = [
   "bool", "f16", "f32", "f64", "i32", "i64", "u32", "u64",
   "vec2", "vec3", "vec4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3",
   "mat3x4", "mat4x2", "mat4x3", "mat4x4", "array", "atomic", "ptr",
-  "sampler", "texture_1d", "texture_2d", "texture_3d", "texture_cube",
+  "_", "sampler", "texture_1d", "texture_2d", "texture_3d", "texture_cube",
 ].toHashSet()
 
 const HlslReserved* = [
@@ -281,18 +281,33 @@ proc renameReservedIdentifiers(m: CirModule, reserved: HashSet[string], doubleUn
         let unique = uniqueSafeName(usedNames, safe)
         symRenames[p.name] = unique
         p.name = unique
-    # declarations rename first: the body walk reads the maps that they feed
+    # declarations rename first: the body walk reads the maps that they feed,
+    # nested blocks included (an inlined loop counter `_` sits in a branch)
     var decls: seq[tuple[name: string, safe: string]]
-    for s in fn.body.mitems:
-      case s.kind
-      of sVar:
-        let safe = makeSafeIdent(s.name, reserved, doubleUnderscorePrefix)
-        if safe != s.name:
-          let unique = uniqueSafeName(usedNames, safe)
-          decls.add((s.name, unique))
-          s.name = unique
-      else:
-        discard
+    proc renameDecls(ss: var seq[CirStmt]) =
+      for s in ss.mitems:
+        case s.kind
+        of sVar:
+          let safe = makeSafeIdent(s.name, reserved, doubleUnderscorePrefix)
+          if safe != s.name:
+            # one map renames all uses: a name declared again in another
+            # block keeps the first one's safe name
+            var unique = ""
+            for d in decls:
+              if d.name == s.name:
+                unique = d.safe
+            if unique.len == 0:
+              unique = uniqueSafeName(usedNames, safe)
+              decls.add((s.name, unique))
+            s.name = unique
+        of sIte:
+          renameDecls(s.thenBody)
+          renameDecls(s.elseBody)
+        of sWhile:
+          renameDecls(s.whileBody)
+        else:
+          discard
+    renameDecls(fn.body)
     for d in decls:
       symRenames[d.name] = d.safe
     fn.body.renameStmts(fieldRenames, symRenames)

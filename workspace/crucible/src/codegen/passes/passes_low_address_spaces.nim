@@ -62,6 +62,11 @@ proc retypeCloneBody(e: CirExpr, retyped: Table[string, CirType]) =
   elif e.kind in {eCast, eConv}:
     if e.castType != nil and e.castType.kind in {ctPtr, ctAptr}:
       e.castType = e.castType.withAddressSpace(resolveAddressSpace(e.castOperand))
+  elif e.kind == eAddr and e.addrType != nil and e.addrType.kind in {ctPtr, ctAptr}:
+    # an address through a re-spaced pointer takes its space, an address of a local keeps its own
+    let (space, found) = pointerSpaceOf(e.addrOperand)
+    if found and space != e.addrType.addressSpace:
+      e.addrType = e.addrType.withAddressSpace(space)
 
 proc cloneCallee(callee: CirProc, wanted: seq[CirType], name: string): CirProc =
   result = CirProc(name: name, ret: callee.ret, isGlobalFn: callee.isGlobalFn,
@@ -152,9 +157,12 @@ proc instantiateAddressSpaceGenericsPass(m: CirModule) =
     ctx.queue[i].body.instantiateCallSitesStmts(ctx)
     i.inc
   # Clones insert after their base callee so the emitted proc order compiles declaration before use
+  # (a clone of a clone after its own base, recursively)
   var placed: seq[CirProc]
-  for fn in m.procs:
+  proc place(fn: CirProc) =
     placed.add fn
     for c in ctx.byBase.getOrDefault(fn.name):
-      placed.add c
+      place(c)
+  for fn in m.procs:
+    place(fn)
   m.procs = placed

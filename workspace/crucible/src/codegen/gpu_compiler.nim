@@ -104,8 +104,12 @@ proc registerGpuPasses*(reg: var PassRegistry, B: CodegenKind) {.compileTime.} =
     registerWgslExplodePointerLocals(reg)
     registerSmemInitRewrite(reg)
     registerWgslHoistProgramScopeLocals(reg)
+    registerWgslLowerCompositeTernaries(reg)
+    registerWgslLowerByrefParams(reg)
+    registerWgslSplitAliasedPointerArgs(reg)
     registerInstantiateAddressSpaceGenerics(reg)
     registerWgslInlinePointerParamCalls(reg)
+    registerWgslPruneUnreachable(reg)
     registerWgslFeatureScan(reg)
     registerValidationPostPasses(reg)
   of cgHlsl:

@@ -36,6 +36,37 @@ func registerWgslHoistProgramScopeLocals*(reg: var PassRegistry) =
     "Relocates smem and const_mem kernel locals into the module's" &
     " program scope")
 
+const wgslPointerParams* {.booldefine.} = false
+  ## Device functions take pointers into storage and workgroup memory
+  ## (WGSL `requires unrestricted_pointer_parameters, pointer_composite_access`,
+  ## Chrome and Dawn have both): large structs pass by reference as in C
+  ## instead of as copies, and no call needs inlining. Storage pointers are
+  ## `read_write`, so they point into the device-buffer bindings only.
+
+func registerWgslLowerByrefParams*(reg: var PassRegistry) =
+  reg.register("wgslLowerByrefParams", pkTransform,
+    "Rewrites passByRef params into pointer params, a call site passes the" &
+    " address of its argument or of a function-local copy",
+    run = wgslLowerByrefParams)
+
+func registerWgslLowerCompositeTernaries*(reg: var PassRegistry) =
+  reg.register("wgslLowerCompositeTernaries", pkTransform,
+    "Rewrites a ternary over structs or arrays, which WGSL `select` refuses," &
+    " in assignment, declaration or return position into an if-else",
+    run = lowerCompositeTernaries)
+
+func registerWgslSplitAliasedPointerArgs*(reg: var PassRegistry) =
+  reg.register("wgslSplitAliasedPointerArgs", pkTransform,
+    "Copies in and out pointer arguments that share a root variable with an" &
+    " earlier argument of the call, WGSL refuses aliased pointer arguments",
+    run = splitAliasedPointerArgs)
+
+func registerWgslPruneUnreachable*(reg: var PassRegistry) =
+  reg.register("wgslPruneUnreachable", pkTransform,
+    "Drops the functions the entry point does not reach (the address-space" &
+    " instantiation leaves the base callees behind)",
+    run = pruneUnreachable)
+
 func registerWgslInlinePointerParamCalls*(reg: var PassRegistry) =
   reg.register("wgslInlinePointerParamCalls", pkTransform,
     "Inlines calls whose pointer arguments cannot cross a WGSL function" &
@@ -47,9 +78,13 @@ func registerWgslInlinePointerParamCalls*(reg: var PassRegistry) =
 # ═══════════════════════════════════════════════════════════════════════
 
 proc crossesWgslSignature(t: CirType): bool =
-  ## WGSL function signatures accept values and ptr<function> pointers only.
+  ## WGSL function signatures accept values and ptr<function> pointers only,
+  ## and storage and workgroup pointers with `wgslPointerParams`.
   if t.isNil:
     return false
+  when wgslPointerParams:
+    if t.kind in {ctPtr, ctAptr} and t.addressSpace in {caThread, caDevice, caThreadgroup}:
+      return false
   case t.kind
   of ctAptr:
     result = true
@@ -266,3 +301,300 @@ proc inlinePointerParamCalls(m: CirModule) =
     kept.add fn
   m.procs = kept
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  By-ref parameters (wgslPointerParams)
+# ═══════════════════════════════════════════════════════════════════════
+
+type ByrefCtx = object
+  byref: Table[string, seq[int]]
+    ## callee name -> indices of its by-ref formals
+  readOnly: HashSet[string]
+    ## entry parameters bound as read-only storage values: no `read_write` pointer names them
+  globals: Table[string, AddressSpace]
+    ## program-scope variables
+  tmpCount: int
+
+proc byrefArgSpace(ctx: ByrefCtx, e: CirExpr): tuple[space: AddressSpace, ok: bool] =
+  ## Space of the storage an lvalue argument names; `ok` false when no
+  ## printable pointer names it (a read-only binding, a constant).
+  let (space, found) = pointerSpaceOf(e)
+  if found:
+    return (space, space in {caThread, caDevice, caThreadgroup})
+  var root = e
+  while root.kind in {eAt, ePat, eDot}:
+    root = case root.kind
+      of eAt: root.atBase
+      of ePat: root.patBase
+      else: root.dotBase
+  if root.kind != eSym:
+    return (caThread, false)
+  if root.name in ctx.readOnly:
+    return (caDevice, false)
+  if ctx.globals.hasKey(root.name):
+    let g = ctx.globals[root.name]
+    return (g, g == caThreadgroup)
+  (caThread, true)
+
+proc byrefWrapArgs(ctx: var ByrefCtx, pre: var seq[CirStmt], e: CirExpr) =
+  ## Nested calls first, so a call sees its arguments already rewritten.
+  if e.isNil:
+    return
+  for ch in getExprChildren(e):
+    ctx.byrefWrapArgs(pre, ch)
+  if e.kind != eCall or e.callee.kind != eSym:
+    return
+  for i in ctx.byref.getOrDefault(e.callee.name):
+    if i >= e.args.len:
+      break
+    let a = e.args[i]
+    let at = getExprType(a)
+    if at == nil or at.kind notin {ctStruct, ctArray}:
+      continue
+    if a.kind == eDeref and a.derefOperand.kind == eSym:
+      # a by-ref formal passed on: the pointer itself, re-spaced with its owner
+      e.args[i] = a.derefOperand
+      continue
+    let (space, ok) = ctx.byrefArgSpace(a)
+    if ok and isLvalue(a):
+      e.args[i] = addrE(tPtr(space, at), a)
+    else:
+      inc ctx.tmpCount
+      let tmpName = "byref_tmp" & $ctx.tmpCount
+      let tmp = sym(tmpName, at)
+      pre.add(varD(tmpName, at))
+      pre.add(asgnS(tmp, a))
+      e.args[i] = addrE(tPtr(caThread, at), tmp)
+
+proc byrefWrapStmts(ctx: var ByrefCtx, stmts: var seq[CirStmt]) =
+  var i = 0
+  while i < stmts.len:
+    var pre: seq[CirStmt] = @[]
+    let s = stmts[i]
+    case s.kind
+    of sAsgn:
+      ctx.byrefWrapArgs(pre, s.lhs)
+      ctx.byrefWrapArgs(pre, s.rhs)
+    of sIte:
+      ctx.byrefWrapArgs(pre, s.cond)
+      ctx.byrefWrapStmts(s.thenBody)
+      ctx.byrefWrapStmts(s.elseBody)
+    of sWhile:
+      ctx.byrefWrapArgs(pre, s.whileCond)
+      ctx.byrefWrapStmts(s.whileBody)
+    of sRet:
+      ctx.byrefWrapArgs(pre, s.retVal)
+    of sDiscard:
+      ctx.byrefWrapArgs(pre, s.discardVal)
+    of sCall:
+      let callE = CirExpr(kind: eCall)
+      callE.callee = s.callCallee
+      callE.args = s.callArgs
+      ctx.byrefWrapArgs(pre, callE)
+      s.callCallee = callE.callee
+      s.callArgs = callE.args
+    of sVar:
+      ctx.byrefWrapArgs(pre, s.init)
+    of sAsm, sEmit:
+      discard
+    for h in pre:
+      stmts.insert(h, i)
+      i.inc
+    i.inc
+
+proc wgslLowerByrefParams(m: CirModule) =
+  ## Contract:
+  ## - a `passByRef` formal (or a large array) of a device function becomes
+  ##   a `ptr<function>` to it, its reads deref it; the address-space instantiation
+  ##   re-spaces it after the arguments
+  ## - a call site passes the argument's address, a by-ref formal passes on
+  ##   as itself, a value or read-only binding copies into a fresh local first
+  ## - entry functions keep their bindings
+  when wgslPointerParams:
+    var ctx: ByrefCtx
+    for g in m.globals:
+      if g.kind == sVar:
+        ctx.globals[g.name] = g.addressSpace
+    for fn in m.procs:
+      if fn.isGlobalFn:
+        for p in fn.params:
+          if p.typ.kind notin {ctPtr, ctAptr}:
+            ctx.readOnly.incl(p.name)
+    for fn in m.procs:
+      if fn.isGlobalFn:
+        continue
+      for i, p in fn.params.mpairs:
+        # the frontend marks large structs; a large array (a table per gas) goes by reference too
+        if not (p.passByRef or p.typ.isLargeArray):
+          continue
+        let ptrT = tPtr(caThread, p.typ)
+        let name = p.name
+        p.name = "_p_" & name
+        let ptrName = p.name
+        fn.body.walkStmts(nil, proc(e: CirExpr) =
+          if e.kind == eSym and e.name == name:
+            e[] = derefE(sym(ptrName, ptrT))[])
+        p.typ = ptrT
+        p.passByRef = false
+        ctx.byref.mgetOrPut(fn.name, @[]).add(i)
+    for fn in m.procs:
+      ctx.byrefWrapStmts(fn.body)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Composite ternaries
+# ═══════════════════════════════════════════════════════════════════════
+
+proc isComposite(e: CirExpr): bool =
+  let t = getExprType(e)
+  t != nil and t.kind in {ctStruct, ctArray}
+
+proc lowerCompositeTernaryStmts(ss: var seq[CirStmt]) =
+  ## `x = c ? a : b` -> `if c: x = a else: x = b`, a declaration first
+  ## declares, a return returns in both branches. Only the chosen branch
+  ## evaluates, as in Nim.
+  var i = 0
+  while i < ss.len:
+    let s = ss[i]
+    case s.kind
+    of sAsgn:
+      if s.rhs != nil and s.rhs.kind == eTernary and s.rhs.isComposite:
+        let t = s.rhs
+        ss[i] = CirStmt(kind: sIte, cond: t.cond,
+          thenBody: @[asgnS(s.lhs, t.thenE)], elseBody: @[asgnS(s.lhs, t.elseE)])
+        continue
+    of sVar:
+      if s.init != nil and s.init.kind == eTernary and s.init.isComposite:
+        let t = s.init
+        s.init = nil
+        let target = sym(s.name, s.declType)
+        ss.insert(CirStmt(kind: sIte, cond: t.cond,
+          thenBody: @[asgnS(target, t.thenE)], elseBody: @[asgnS(target, t.elseE)]), i + 1)
+    of sRet:
+      if s.retVal != nil and s.retVal.kind == eTernary and s.retVal.isComposite:
+        let t = s.retVal
+        ss[i] = CirStmt(kind: sIte, cond: t.cond,
+          thenBody: @[CirStmt(kind: sRet, retVal: t.thenE)],
+          elseBody: @[CirStmt(kind: sRet, retVal: t.elseE)])
+        continue
+    of sIte:
+      lowerCompositeTernaryStmts(s.thenBody)
+      lowerCompositeTernaryStmts(s.elseBody)
+    of sWhile:
+      lowerCompositeTernaryStmts(s.whileBody)
+    else:
+      discard
+    i.inc
+
+proc lowerCompositeTernaries(m: CirModule) =
+  for fn in m.procs:
+    lowerCompositeTernaryStmts(fn.body)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Aliased pointer arguments
+# ═══════════════════════════════════════════════════════════════════════
+
+proc pointerRoot(e: CirExpr): string =
+  ## The variable a pointer argument points into, "" for none.
+  var x = e
+  while x != nil:
+    case x.kind
+    of eAddr: x = x.addrOperand
+    of eAt: x = x.atBase
+    of ePat: x = x.patBase
+    of eDot: x = x.dotBase
+    of eDeref: x = x.derefOperand
+    of eSym: return x.name
+    else: return ""
+  ""
+
+proc splitAliasedArgs(args: var seq[CirExpr], pre, post: var seq[CirStmt], tmpCount: var int) =
+  ## A second `&lvalue` argument into a root already passed points to a
+  ## fresh local instead, which copies the lvalue in before the call and
+  ## out after it: disjoint fields (the usual case) behave the same.
+  var roots: HashSet[string]
+  for i in 0 ..< args.len:
+    let a = args[i]
+    let t = getExprType(a)
+    if t == nil or t.kind notin {ctPtr, ctAptr}:
+      continue
+    let r = pointerRoot(a)
+    if r.len == 0:
+      continue
+    if r notin roots:
+      roots.incl r
+      continue
+    if a.kind != eAddr or not isLvalue(a.addrOperand):
+      continue
+    let vt = getExprType(a.addrOperand)
+    if vt == nil:
+      continue
+    inc tmpCount
+    let name = "alias_tmp" & $tmpCount
+    let tmp = sym(name, vt)
+    pre.add varD(name, vt, a.addrOperand)
+    post.add asgnS(a.addrOperand, tmp)
+    args[i] = addrE(tPtr(caThread, vt), tmp)
+
+proc splitAliasedStmts(ss: var seq[CirStmt], tmpCount: var int) =
+  var i = 0
+  while i < ss.len:
+    let s = ss[i]
+    var pre, post: seq[CirStmt]
+    case s.kind
+    of sCall:
+      splitAliasedArgs(s.callArgs, pre, post, tmpCount)
+    of sAsgn:
+      if s.rhs != nil and s.rhs.kind == eCall:
+        splitAliasedArgs(s.rhs.args, pre, post, tmpCount)
+    of sVar:
+      if s.init != nil and s.init.kind == eCall:
+        splitAliasedArgs(s.init.args, pre, post, tmpCount)
+    of sDiscard:
+      if s.discardVal != nil and s.discardVal.kind == eCall:
+        splitAliasedArgs(s.discardVal.args, pre, post, tmpCount)
+    of sIte:
+      splitAliasedStmts(s.thenBody, tmpCount)
+      splitAliasedStmts(s.elseBody, tmpCount)
+    of sWhile:
+      splitAliasedStmts(s.whileBody, tmpCount)
+    else:
+      discard
+    for h in pre:
+      ss.insert(h, i)
+      i.inc
+    for k, h in post:
+      ss.insert(h, i + 1 + k)
+    i += 1 + post.len
+
+proc splitAliasedPointerArgs(m: CirModule) =
+  for fn in m.procs:
+    var tmpCount = 0
+    splitAliasedStmts(fn.body, tmpCount)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Unreachable functions
+# ═══════════════════════════════════════════════════════════════════════
+
+proc pruneUnreachable(m: CirModule) =
+  var procs = initTable[string, CirProc]()
+  for fn in m.procs:
+    procs[fn.name] = fn
+  var reached: HashSet[string]
+  var todo: seq[CirProc]
+  for fn in m.procs:
+    if fn.isGlobalFn:
+      reached.incl fn.name
+      todo.add fn
+  while todo.len > 0:
+    let fn = todo.pop()
+    var targets: HashSet[string]
+    collectCallTargets(targets, fn.body)
+    for t in targets:
+      if t notin reached and procs.hasKey(t):
+        reached.incl t
+        todo.add procs[t]
+  var kept: seq[CirProc]
+  for fn in m.procs:
+    if fn.name in reached:
+      kept.add fn
+  m.procs = kept

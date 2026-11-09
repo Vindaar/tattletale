@@ -352,6 +352,10 @@ proc computeCirSizeBytes(t: CirType): int =
   of ctVoid, ctProc, ctSpan:
     result = 0
 
+func isLargeArray*(t: CirType): bool =
+  ## An array over the by-value threshold of `isLargeStruct`.
+  t != nil and t.kind == ctArray and computeCirSizeBytes(t) > 24
+
 func isLargeStruct*(t: CirType): bool =
   ## Its 24-byte threshold matches the C backend's 3-pointer by-value rule.
   t != nil and t.kind == ctStruct and computeCirSizeBytes(t) > 24
@@ -605,6 +609,32 @@ func resolveAddressSpace*(e: CirExpr): AddressSpace =
   of eStmts:
     if e.valueExpr != nil:
       result = resolveAddressSpace(e.valueExpr)
+  else:
+    discard
+
+func pointerSpaceOf*(e: CirExpr): tuple[space: AddressSpace, found: bool] =
+  ## Address space of the innermost pointer an access chain reads through,
+  ## `found` false for a chain with no pointer (a local or a parameter value),
+  ## where `resolveAddressSpace` answers its `caDevice` default.
+  case e.kind
+  of eSym:
+    if e.typ != nil and e.typ.kind in {ctPtr, ctAptr}:
+      result = (e.typ.addressSpace, true)
+  of eDeref, eAt, ePat, eDot:
+    let base = case e.kind
+      of eDeref: e.derefOperand
+      of eAt: e.atBase
+      of ePat: e.patBase
+      else: e.dotBase
+    if base != nil:
+      let t = getExprType(base)
+      if t != nil and t.kind in {ctPtr, ctAptr}:
+        result = (t.addressSpace, true)
+      else:
+        result = pointerSpaceOf(base)
+  of eAddr:
+    if e.addrType != nil and e.addrType.kind in {ctPtr, ctAptr}:
+      result = (e.addrType.addressSpace, true)
   else:
     discard
 

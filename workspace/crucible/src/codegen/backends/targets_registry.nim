@@ -45,7 +45,12 @@ genTargets:
       lanes 2, 3, 4
 
   target wgsl:
-    math rsqrt 32 "inverseSqrt"
+    math rsqrt 32 "inverseSqrt",
+      # <math.h> imports under their C names (in 32 bits, also after demotion)
+      logf 32 "log", log 32 "log", expf 32 "exp", exp 32 "exp", sqrtf 32 "sqrt",
+      sinf 32 "sin", cosf 32 "cos", tanf 32 "tan", asinf 32 "asin", acosf 32 "acos",
+      atanf 32 "atan", fabsf 32 "abs", fabs 32 "abs", truncf 32 "trunc",
+      floorf 32 "floor", ceilf 32 "ceil", log2f 32 "log2", exp2f 32 "exp2"
     kind unrollDirective "// {.unroll.} requested but not honored on WebGPU", braceSameLine true,
       targetExprKinds {eNil, eAt, ePat, eTernary, eFloatLit}
     vector:
