@@ -31,6 +31,7 @@ import ./passes/passes_low_reserved
 import ./passes/passes_low_pointers
 import ./passes/passes_low_array_assign
 import ./passes/passes_low_address_spaces
+import ./passes/pass_demote_f64
 import ./backends/backends_api
 import ./ir/cirv2_pretty
 
@@ -141,6 +142,19 @@ macro cuda*(body: untyped): string =
   crucibleCompileTarget = ctCuda
   result = newCall(bindSym"cudaImpl", body)
 
+macro cudaSingleImpl(body: typed): string =
+  var reg = PassRegistry()
+  reg.registerGpuPasses(cgCuda)
+  let m = lowerCirv2(body)
+  demoteFloat64(m)
+  reg.runPasses(m)
+  result = newLit(codegenSource(m, cgCuda))
+
+macro cudaSingle*(body: untyped): string =
+  ## `cuda` with every `float64` demoted to `float32` (see pass_demote_f64)
+  crucibleCompileTarget = ctCuda
+  result = newCall(bindSym"cudaSingleImpl", body)
+
 macro openclImpl(body: typed): string =
   var reg = PassRegistry()
   reg.registerGpuPasses(cgOpenCL)
@@ -184,6 +198,20 @@ macro webgpuImpl(body: typed): string =
 macro webgpu*(body: untyped): string =
   crucibleCompileTarget = ctWebGPU
   result = newCall(bindSym"webgpuImpl", body)
+
+macro webgpuSingleImpl(body: typed): string =
+  var reg = PassRegistry()
+  reg.registerGpuPasses(cgWebGPU)
+  let m = lowerCirv2(body)
+  demoteFloat64(m)
+  reg.runPasses(m)
+  result = newLit(codegenSource(m, cgWebGPU))
+
+macro webgpuSingle*(body: untyped): string =
+  ## `webgpu` for code written with `float64`, which WGSL lacks: every
+  ## `float64` demoted to `float32` (see pass_demote_f64)
+  crucibleCompileTarget = ctWebGPU
+  result = newCall(bindSym"webgpuSingleImpl", body)
 
 macro hlslImpl(body: typed, flavor: static HlslFlavor = fvD3D12): string =
   var reg = PassRegistry()

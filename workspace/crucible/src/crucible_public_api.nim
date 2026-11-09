@@ -14,7 +14,7 @@
 ## | Launch sugar  | `launchKernel`, `launchDeviceFn`, `launchCpuFn`, chevrons `<<`/`>>`, `LaunchSugar`, `DeviceFnSugar`, `DeviceFnProxy`, `LaunchConfig` |
 ## | Batch         | `recordBatch`, `enqueue`, `submit`, chevrons `<<`/`>>`, `Batch`, `BatchEntry`, `EnqueueSugar`, `EnqueueProxy`                        |
 ## | Geometry      | `Dim3`, `dim3`                                                                                                                       |
-## | Codegen       | `cuda`, `opencl`, `glsl`, `webgpu`, `metal`, `hlsl` (+ `HlslFlavor`), `spirv`                                                        |
+## | Codegen       | `cuda`, `cudaSingle`, `opencl`, `glsl`, `webgpu`, `webgpuSingle`, `metal`, `hlsl` (+ `HlslFlavor`), `spirv`                                                      |
 
 import
   ./codegen/gpu_compiler,
@@ -54,7 +54,7 @@ export batch.Batch, batch.BatchEntry, batch.EnqueueSugar, batch.EnqueueProxy
 
 export gpu_compiler.cuda, gpu_compiler.opencl, gpu_compiler.glsl,
        gpu_compiler.webgpu, gpu_compiler.metal, gpu_compiler.hlsl,
-       gpu_compiler.spirv
+       gpu_compiler.spirv, gpu_compiler.cudaSingle, gpu_compiler.webgpuSingle
 # exporting the type also exports the non-pure enum's members by name,
 # individual enum fields cannot be exported ("enum field cannot be exported individually")
 from ./codegen/backends/lang_hlsl import HlslFlavor
