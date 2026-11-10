@@ -228,7 +228,7 @@ macro cpuExecLower(engine: CpuEngine, wrapper: typed, gridN, blkN, coarsenN: unt
   var launchBody = nnkStmtList.newTree(gridDecl, blkDecl,
     nnkCall.newTree(bindSym"assertDimsWithinInt32", gridVar, blkVar),
     hoists)
-  let serial = not compileOption("threads")
+  let serial = not cpuPool
   if not serial:
     # envSize in the pooled tail is the data-struct size cast to int32_t,
     # a struct at or above 2^31 bytes wraps the cast
@@ -381,7 +381,7 @@ macro launchCpuFn*(engine: CpuEngine, call: untyped): untyped =
       of "workgroupsPerTask":
         if a[1].kind == nnkIntLit and a[1].intVal < 1:
           error("launchCpuFn: workgroupsPerTask must be >= 1, got " & $a[1].intVal, a)
-        if not compileOption("threads") and a[1].kind != nnkIntLit:
+        if not cpuPool and a[1].kind != nnkIntLit:
           error("launchCpuFn: the serial launch has no pool tasks, workgroupsPerTask must be an integer literal (it is ignored), got the expression " & a[1].repr, a)
         coarsenN = a[1]
   for i in 1 ..< callNode.len:

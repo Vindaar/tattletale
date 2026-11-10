@@ -13,7 +13,11 @@
 ## arguments are host values, there is no ingest, no artifact and no DeviceMem.
 
 import std/cpuinfo
-when compileOption("threads"):
+
+const cpuPool* = compileOption("threads") and not defined(emscripten)
+  ## the worker pool: with threads, but not under Emscripten (no Linux futexes)
+
+when cpuPool:
   import workspace/threadpool_compute
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -24,17 +28,17 @@ type
   CpuEngine* = ref object
     ## CPU execution engine. Owns the worker pool.
     deviceName*: string
-    when compileOption("threads"):
+    when cpuPool:
       tp*: ptr Threadpool
 
 proc newCpuEngine*(numThreads: int = 0): CpuEngine =
   result = CpuEngine(deviceName: "crucible-cpu")
-  when compileOption("threads"):
+  when cpuPool:
     let n = if numThreads > 0: numThreads else: countProcessors()
     result.tp = threadpool_new(int32(n))
 
 proc destroyCpuEngine*(engine: CpuEngine) =
-  when compileOption("threads"):
+  when cpuPool:
     doAssert engine.tp != nil,
       "destroyCpuEngine: the engine's pool is already shut down"
     threadpool_shutdown(engine.tp)
